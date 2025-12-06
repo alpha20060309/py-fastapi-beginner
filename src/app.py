@@ -1,8 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
 from src.schema import PostCreate
 from src.db import Post, create_db_and_tables, get_async_session
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from src.images import imagekit
+from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
+import shutil
+import os
+import uuid
+import tempfile
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -11,65 +18,85 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-text_posts = {
-    1: {
-        "title": "Exploring FastAPI for Building APIs",
-        "content": "FastAPI is a modern, fast web framework for building APIs with Python 3.7+ based on standard Python type hints."
-    },
-    2: {
-        "title": "Python 3.12 Released!",
-        "content": "The Python Software Foundation has released Python 3.12 with new optimizations, syntax features, and improved error messages."
-    },
-    3: {
-        "title": "Tips for Effective Remote Work",
-        "content": "Maintain a regular schedule, invest in a comfortable workspace, and communicate proactively with your team."
-    },
-    4: {
-        "title": "How to Cook Perfect Rice",
-        "content": "Rinse your rice before cooking, use the right water-to-rice ratio, and let it rest after cooking for fluffy grains."
-    },
-    5: {
-        "title": "Best Hiking Trails in California",
-        "content": "Yosemite's Mist Trail, Mount Tamalpais, and the Lost Coast Trail are top picks for breathtaking hikes."
-    },
-    6: {
-        "title": "Understanding Artificial Intelligence",
-        "content": "AI is a field of computer science that aims to create systems capable of performing tasks that usually require human intelligence."
-    },
-    7: {
-        "title": "Upcoming Tech Conferences 2024",
-        "content": "Attend CES in Las Vegas, PyCon US in Pittsburgh, or Web Summit in Lisbon for networking and learning opportunities."
-    },
-    8: {
-        "title": "Simple Vegan Pancake Recipe",
-        "content": "Mix flour, plant milk, baking powder, and a dash of salt. Cook on a skillet until bubbles form, then flip."
-    },
-    9: {
-        "title": "Improving Mental Health",
-        "content": "Practice mindfulness, stay connected with friends, and seek professional help if experiencing ongoing stress or sadness."
-    },
-    10: {
-        "title": "Guide to Investing for Beginners",
-        "content": "Start with index funds, diversify your portfolio, and invest regularly for long-term growth."
-    }
-}
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    session: AsyncSession = Depends(get_async_session)
+):
+    temp_file_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tempfile:
+            temp_file_path = tempfile.name
+            shutil.copyfileobj(file.file,tempfile)
+
+        upload_result = imagekit.upload(
+            file=open(temp_file_path,"rb")
+            file_name=file.filename,
+            options=UploadFileRequestOptions(
+                use_unique_file_name=True,
+                tags=["backend_upload"]
+            )
+        )
+
+        if upload_result.response_metadata.http_status_code == 200:
+
+            post = Post(
+                caption = caption,
+                url = upload_result.url,
+                file_type = "video" if file.content_type.startswith("video/") else "image",
+                file_name = upload_result.name
+            )
+            session.add(session)
+            await session.commit()
+            await session.refresh(post)
+
+            return post
+    except Exception as e:
+        raise HTTPException(status_code=500, message=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        file.file.close()
 
 
-@app.get("/posts")
-def get__all_posts(limit: int = None):
-    if limit:
-        return list(text_posts.values())[:limit]
-    return text_posts
+@app.get("/feed")
+async def get_feed(
+    session : AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.all()]
 
+    post_data = []
 
-@app.get("/posts/{id}")
-def get_post(id: int):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return text_posts[id]
+    for post in posts:
+        post_data.append(
+            {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat()
+            }
+        )
+    return {"post":post_data}
 
-@app.post("/posts")
-def create_post(post: PostCreate) -> PostCreate:
-    new_post = {"title": post.title, "content": post.content}
-    text_posts[len(text_posts.keys()) + 1] = new_post
-    return new_post
+@app.delete("/posts/{post_id}")
+async def delete_post(post_id: str, session: AsyncSession=Depends(get_async_session)):
+    try:
+        post_uuid=uuid.UUID(post_id)
+
+        result = await session.execute(select(Post).where(Post.id == post_uuid))
+        post = result.scalars().first()
+
+        if not post:
+            raise HTTPException(status_code=404, message="Post not found")
+        
+        await session.delete(post)
+        await session.commit()
+
+        return {"success": True, "message": f"{post_uuid} post deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500,detail=str(e))
