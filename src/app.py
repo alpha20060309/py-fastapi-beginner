@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
-from src.schema import PostCreate
-from src.db import Post, create_db_and_tables, get_async_session
+from src.schema import PostCreate, UserRead, UserCreate, UserUpdate
+from src.db import Post, create_db_and_tables, get_async_session, User
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
 from sqlalchemy import select
@@ -10,6 +10,7 @@ import shutil
 import os
 import uuid
 import tempfile
+from src.users import auth_backend,current_active_user, fastapi_users
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -17,6 +18,36 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+app.include_router(
+    fastapi_users.get_auth_router(auth_backend),
+    prefix="/auth/jwt",
+    tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_register_router(
+        UserCreate,  
+        UserRead
+    ),
+    prefix="/auth",
+    tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_reset_password_router(),
+    prefix="/auth",
+    tags=["auth"]
+)
+
+app.include_router(
+    fastapi_users.get_verify_router(UserRead),
+    prefix="/auth",
+    tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_users_router(UserRead,UserUpdate),
+    prefix="/users",
+    tags=["users"]
+)
 
 @app.post("/upload")
 async def upload_file(
@@ -27,12 +58,12 @@ async def upload_file(
     temp_file_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tempfile:
-            temp_file_path = tempfile.name
-            shutil.copyfileobj(file.file,tempfile)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+            temp_file_path = tmp.name
+            shutil.copyfileobj(file.file,tmp)
 
         upload_result = imagekit.upload(
-            file=open(temp_file_path,"rb")
+            file=open(temp_file_path, "rb"),
             file_name=file.filename,
             options=UploadFileRequestOptions(
                 use_unique_file_name=True,
@@ -48,13 +79,13 @@ async def upload_file(
                 file_type = "video" if file.content_type.startswith("video/") else "image",
                 file_name = upload_result.name
             )
-            session.add(session)
+            session.add(post)
             await session.commit()
             await session.refresh(post)
 
             return post
     except Exception as e:
-        raise HTTPException(status_code=500, message=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.unlink(temp_file_path)
@@ -92,7 +123,7 @@ async def delete_post(post_id: str, session: AsyncSession=Depends(get_async_sess
         post = result.scalars().first()
 
         if not post:
-            raise HTTPException(status_code=404, message="Post not found")
+            raise HTTPException(status_code=404, detail="Post not found")
         
         await session.delete(post)
         await session.commit()
